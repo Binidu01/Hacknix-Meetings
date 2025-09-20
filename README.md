@@ -45,10 +45,10 @@ A modern, real-time video conferencing web application that enables seamless com
 ### Quick Start
 ```bash
 # Clone the repository
-git clone undefined.git
+git clone https://github.com/Binidu01/Hacknix-Meetings-.git
 
 # Navigate to project directory
-cd undefined
+cd Hacknix-Meetings-
 
 # Install dependencies
 npm install
