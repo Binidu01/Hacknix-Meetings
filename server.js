@@ -2,671 +2,519 @@ import express from 'express';
 import { createServer } from 'http';
 import { Server } from 'socket.io';
 import cors from 'cors';
-import { createAdapter } from '@socket.io/redis-adapter';
-import { createClient } from 'redis';
+import mediasoup from 'mediasoup';
 import compression from 'compression';
 import rateLimit from 'express-rate-limit';
-import { LRUCache } from 'lru-cache';
 
 const app = express();
 const server = createServer(app);
 
-// Compression middleware
 app.use(compression());
+app.use(cors({
+  origin: ['http://localhost:3000', 'http://localhost:3001'],
+  credentials: true
+}));
 
-// Express rate limiting
 const limiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 1000, // limit each IP to 1000 requests per windowMs
-  standardHeaders: true,
-  legacyHeaders: false,
+  windowMs: 15 * 60 * 1000,
+  max: 1000
 });
 app.use(limiter);
 
-// Enable CORS
-const corsOptions = {
-  origin: process.env.ALLOWED_ORIGINS?.split(',') || [
-    'http://localhost:3000',
-    'http://localhost:3001',
-    'https://yourdomain.com'
-  ],
-  credentials: true,
-  optionsSuccessStatus: 200
-};
-app.use(cors(corsOptions));
-
-// Redis clients
-let pubClient, subClient;
-if (process.env.REDIS_URL) {
-  try {
-    pubClient = createClient({ url: process.env.REDIS_URL });
-    subClient = pubClient.duplicate();
-
-    await Promise.all([pubClient.connect(), subClient.connect()]);
-    console.log('✅ Redis connected successfully');
-  } catch (error) {
-    console.warn('⚠️ Redis connection failed, using in-memory storage:', error.message);
-  }
-}
-
-// Socket.IO server
 const io = new Server(server, {
-  cors: corsOptions,
+  cors: { origin: '*' },
   transports: ['websocket', 'polling'],
-  allowEIO3: true,
   pingTimeout: 30000,
-  pingInterval: 15000,
-  connectionStateRecovery: {
-    maxDisconnectionDuration: 2 * 60 * 1000,
-    skipMiddlewares: true,
+  pingInterval: 15000
+});
+
+// ==================== MEDIASOUP SETUP ====================
+let worker;
+let router;
+
+const mediaCodecs = [
+  {
+    kind: 'audio',
+    mimeType: 'audio/opus',
+    clockRate: 48000,
+    channels: 2
   },
-  maxHttpBufferSize: 1e6,
-  httpCompression: true,
-  wsCompression: false,
-});
-
-// Use Redis adapter if available
-if (pubClient && subClient) {
-  io.adapter(createAdapter(pubClient, subClient));
-}
-
-// Room management
-const MAX_ROOMS = 200;
-const MAX_USERS_PER_ROOM = 150;
-const MAX_CHAT_HISTORY = 100;
-
-class OptimizedRoom {
-  constructor(id) {
-    this.id = id;
-    this.users = new Map();
-    this.chatHistory = [];
-    this.createdAt = Date.now();
-    this.lastActivity = Date.now();
-    this._usersList = null;
-    this._usersListExpiry = 0;
-    this.messageCount = 0;
+  {
+    kind: 'video',
+    mimeType: 'video/VP8',
+    clockRate: 90000,
+    parameters: {
+      'x-google-start-bitrate': 1000
+    }
+  },
+  {
+    kind: 'video',
+    mimeType: 'video/VP9',
+    clockRate: 90000,
+    parameters: {
+      'profile-id': 2,
+      'x-google-start-bitrate': 1000
+    }
+  },
+  {
+    kind: 'video',
+    mimeType: 'video/h264',
+    clockRate: 90000,
+    parameters: {
+      'packetization-mode': 1,
+      'profile-level-id': '4d0032',
+      'level-asymmetry-allowed': 1,
+      'x-google-start-bitrate': 1000
+    }
   }
+];
 
-  addUser(socketId, userData) {
-    if (this.users.size >= MAX_USERS_PER_ROOM) throw new Error('Room is full');
-    this.users.set(socketId, {
-      id: socketId,
-      name: userData.name,
-      cameraOn: userData.cameraOn,
-      audioOn: userData.audioOn,
-      screenShareOn: userData.screenShareOn,
-      joinedAt: Date.now()
+// ==================== STATE MANAGEMENT ====================
+const rooms = new Map();
+const peers = new Map();
+const roomProducers = new Map();
+const chatHistory = new Map();
+const roomStartTime = new Map();
+
+class RoomManager {
+  static addUser(roomId, socketId, name) {
+    if (!rooms.has(roomId)) {
+      rooms.set(roomId, new Set());
+      chatHistory.set(roomId, []);
+      roomStartTime.set(roomId, Date.now());
+      roomProducers.set(roomId, new Map());
+    }
+    rooms.get(roomId).add(socketId);
+    
+    peers.set(socketId, {
+      name,
+      roomId,
+      transports: new Map(),
+      producers: new Map(),
+      consumers: new Map()
     });
-    this.lastActivity = Date.now();
-    this._invalidateCache();
   }
 
-  removeUser(socketId) {
-    const removed = this.users.delete(socketId);
-    if (removed) {
-      this.lastActivity = Date.now();
-      this._invalidateCache();
-    }
-    return removed;
-  }
-
-  updateUserStatus(socketId, status) {
-    const user = this.users.get(socketId);
-    if (!user) return null;
-
-    if (status.cameraOn !== undefined) user.cameraOn = status.cameraOn;
-    if (status.audioOn !== undefined) user.audioOn = status.audioOn;
-    if (status.screenShareOn !== undefined) user.screenShareOn = status.screenShareOn;
-    if (status.name !== undefined) user.name = status.name;
-
-    this.lastActivity = Date.now();
-    this._invalidateCache();
-    return user;
-  }
-
-  getUsersArray() {
-    const now = Date.now();
-    if (!this._usersList || now > this._usersListExpiry) {
-      this._usersList = Array.from(this.users.values());
-      this._usersListExpiry = now + 5000;
-    }
-    return this._usersList;
-  }
-
-  getUsersStatus() {
-    const status = {};
-    for (const [socketId, user] of this.users) {
-      status[socketId] = {
-        cameraOn: user.cameraOn,
-        audioOn: user.audioOn,
-        screenShareOn: user.screenShareOn
-      };
-    }
-    return status;
-  }
-
-  _invalidateCache() {
-    this._usersList = null;
-    this._usersListExpiry = 0;
-  }
-
-  isEmpty() {
-    return this.users.size === 0;
-  }
-
-  addMessage(chatMessage) {
-    this.messageCount++;
-    this.chatHistory.push({
-      ...chatMessage,
-      id: this.messageCount
-    });
-    
-    if (this.chatHistory.length > MAX_CHAT_HISTORY) {
-      this.chatHistory.shift();
-    }
-    
-    this.lastActivity = Date.now();
-  }
-
-  getChatHistory(limit = MAX_CHAT_HISTORY) {
-    return this.chatHistory.slice(-limit);
-  }
-}
-
-// LRU cache for rooms
-const rooms = new LRUCache({
-  max: MAX_ROOMS,
-  ttl: 1000 * 60 * 60 * 2, // 2 hours
-  allowStale: false,
-  updateAgeOnGet: true,
-  dispose: (roomId, room) => {
-    console.log(`🗑️ Room ${roomId} disposed from cache (${room.users.size} users, ${room.chatHistory.length} messages)`);
-    if (room.users.size > 0) {
-      io.to(roomId).emit('room-disposed', { 
-        message: 'Room has been disposed due to inactivity',
-        timestamp: Date.now()
-      });
-    }
-  }
-});
-
-// Rate limiting
-const rateLimits = new LRUCache({ 
-  max: 10000, 
-  ttl: 1000 * 60 * 5,
-  updateAgeOnGet: false
-});
-
-const isRateLimited = (socketId, action, limit = 10, windowMs = 60000) => {
-  const key = `${socketId}:${action}`;
-  const now = Date.now();
-  let rateLimit = rateLimits.get(key);
-  
-  if (!rateLimit || now > rateLimit.resetTime) {
-    rateLimits.set(key, { count: 1, resetTime: now + windowMs });
-    return false;
-  }
-  
-  if (rateLimit.count >= limit) return true;
-  rateLimit.count++;
-  rateLimits.set(key, rateLimit);
-  return false;
-};
-
-// Utility functions
-const getOrCreateRoom = (roomId) => {
-  let room = rooms.get(roomId);
-  if (!room) {
-    room = new OptimizedRoom(roomId);
-    rooms.set(roomId, room);
-    console.log(`🏠 Created new room: ${roomId}`);
-  }
-  return room;
-};
-
-// Cleanup function
-let cleanupScheduled = false;
-const scheduleCleanup = () => {
-  if (cleanupScheduled) return;
-  cleanupScheduled = true;
-  
-  setTimeout(() => {
-    cleanupScheduled = false;
-    const now = Date.now();
-    const maxInactiveTime = 30 * 60 * 1000;
-    let cleanedRooms = 0;
-    
-    for (const [roomId, room] of rooms.entries()) {
-      if (room.isEmpty() && (now - room.lastActivity) > maxInactiveTime) {
-        rooms.delete(roomId);
-        cleanedRooms++;
-        console.log(`🧹 Cleaned up empty room: ${roomId}`);
-      }
-    }
-    
-    if (cleanedRooms > 0) {
-      console.log(`🧹 Cleanup completed: ${cleanedRooms} rooms removed`);
-    }
-  }, 60000);
-};
-
-// Connection stats
-const connectionStats = { 
-  total: 0, 
-  peak: 0, 
-  lastPeakTime: Date.now(),
-  totalConnections: 0
-};
-
-// Socket.IO handlers
-io.on('connection', (socket) => {
-  connectionStats.total++;
-  connectionStats.totalConnections++;
-  
-  if (connectionStats.total > connectionStats.peak) {
-    connectionStats.peak = connectionStats.total;
-    connectionStats.lastPeakTime = Date.now();
-  }
-  
-  console.log(`👤 Connected: ${socket.id} (Total: ${connectionStats.total}, Peak: ${connectionStats.peak})`);
-
-  let currentRoomId = null;
-  let userName = null;
-
-  // Ping-pong for latency measurement
-  socket.on('ping-from-client', () => {
-    socket.emit('pong-from-server', Date.now());
-  });
-
-  socket.on('join-room', ({ roomId, name, cameraOn = false, audioOn = false, screenShareOn = false }) => {
-    try {
-      // Input validation
-      if (!roomId?.trim() || !name?.trim() || roomId.length > 50 || name.length > 30) {
-        socket.emit('error', { message: 'Invalid room ID or name' });
-        return;
-      }
-
-      // Rate limiting
-      if (isRateLimited(socket.id, 'join-room', 5, 60000)) {
-        socket.emit('error', { message: 'Too many join attempts. Please wait.' });
-        return;
-      }
-
-      const room = getOrCreateRoom(roomId.trim());
-      currentRoomId = roomId.trim();
-      userName = name.trim();
-
-      // Get existing users and their status
-      const existingUsers = room.getUsersArray().map(u => ({ 
-        id: u.id, 
-        name: u.name,
-        joinedAt: u.joinedAt
-      }));
-      const existingStatus = room.getUsersStatus();
-
-      // Join the socket room
-      socket.join(roomId);
-      
-      // Add user to room
-      room.addUser(socket.id, {
-        name: userName,
-        cameraOn,
-        audioOn,
-        screenShareOn
-      });
-
-      // Send existing users and their status to the new user
-      socket.emit('existing-users', {
-        users: existingUsers,
-        roomUserStatus: existingStatus
-      });
-
-      // NEW: Send current screen share status to the joining user
-      const screenSharers = room.getUsersArray().filter(u => u.screenShareOn);
-      if (screenSharers.length > 0) {
-        screenSharers.forEach(sharer => {
-          socket.emit('user-started-screen-share', { 
-            userId: sharer.id, 
-            name: sharer.name 
-          });
+  static removeUser(socketId) {
+    const peer = peers.get(socketId);
+    if (peer) {
+      if (roomProducers.has(peer.roomId)) {
+        const roomProds = roomProducers.get(peer.roomId);
+        peer.producers.forEach((producer, producerId) => {
+          roomProds.delete(producerId);
         });
       }
 
-      // Send chat history to the joining user
-      const chatHistory = room.getChatHistory();
-      if (chatHistory.length > 0) {
-        socket.emit('chat-history', chatHistory);
-        console.log(`📧 Sent ${chatHistory.length} chat messages to ${userName} in room ${roomId}`);
-      }
-
-      // Notify other users about the new join
-      socket.to(roomId).emit('user-joined', {
-        userId: socket.id,
-        name: userName,
-        cameraOn,
-        audioOn,
-        screenShareOn
-      });
-
-      console.log(`✅ ${userName} joined room ${roomId} (${room.users.size}/${MAX_USERS_PER_ROOM} users, ${room.chatHistory.length} messages)`);
-    } catch (error) {
-      console.error('❌ Error in join-room:', error);
-      socket.emit('error', { 
-        message: error.message === 'Room is full' ? 
-          `Room is full (max ${MAX_USERS_PER_ROOM} users)` : 
-          'Failed to join room. Please try again.' 
-      });
-    }
-  });
-
-  // Enhanced WebRTC signaling with better screen share handling
-  socket.on('offer', (payload) => {
-    const room = rooms.get(currentRoomId);
-    const user = room?.users.get(socket.id);
-    if (user && payload.to) {
-      console.log(`📡 Offer from ${user.name} to ${payload.to} - Screen: ${user.screenShareOn ? 'Yes' : 'No'}`);
-      socket.to(payload.to).emit('offer', {
-        sdp: payload.sdp,
-        from: socket.id,
-        name: user.name,
-        cameraOn: user.cameraOn,
-        audioOn: user.audioOn,
-        screenShareOn: user.screenShareOn
-      });
-    }
-  });
-
-  socket.on('answer', (payload) => {
-    if (!payload?.to || !currentRoomId) return;
-    if (isRateLimited(socket.id, 'signaling', 50, 60000)) return;
-
-    const room = rooms.get(currentRoomId);
-    if (!room?.users.has(socket.id)) return;
-
-    console.log(`📡 Answer from ${socket.id} to ${payload.to}`);
-    socket.to(payload.to).emit('answer', { ...payload, from: socket.id });
-  });
-
-  socket.on('ice-candidate', (payload) => {
-    if (!payload?.to || !currentRoomId) return;
-    if (isRateLimited(socket.id, 'signaling', 100, 60000)) return;
-
-    const room = rooms.get(currentRoomId);
-    if (!room?.users.has(socket.id)) return;
-
-    socket.to(payload.to).emit('ice-candidate', { ...payload, from: socket.id });
-  });
-
-  // Enhanced media status changes with screen share notifications
-  socket.on('media-status-change', (status) => {
-    const room = rooms.get(currentRoomId);
-    if (!room) return;
-    
-    const oldUser = { ...room.users.get(socket.id) };
-    const updatedUser = room.updateUserStatus(socket.id, status);
-    
-    if (updatedUser) {
-      console.log(`📺 Media status change for ${updatedUser.name}: Camera=${updatedUser.cameraOn}, Audio=${updatedUser.audioOn}, Screen=${updatedUser.screenShareOn}`);
+      peer.producers.forEach(producer => producer.close());
+      peer.transports.forEach(transport => transport.close());
       
-      // Broadcast the status change
-      socket.to(currentRoomId).emit('media-status-change', {
-        userId: socket.id,
-        cameraOn: updatedUser.cameraOn,
-        audioOn: updatedUser.audioOn,
-        screenShareOn: updatedUser.screenShareOn
-      });
-
-      // Special handling for screen share state changes
-      if (oldUser.screenShareOn !== updatedUser.screenShareOn) {
-        if (updatedUser.screenShareOn) {
-          console.log(`🖥️ ${updatedUser.name} started screen sharing`);
-          socket.to(currentRoomId).emit('user-started-screen-share', { 
-            userId: socket.id,
-            name: updatedUser.name 
-          });
-        } else {
-          console.log(`🖥️ ${updatedUser.name} stopped screen sharing`);
-          socket.to(currentRoomId).emit('user-stopped-screen-share', { 
-            userId: socket.id,
-            name: updatedUser.name 
-          });
+      if (rooms.has(peer.roomId)) {
+        rooms.get(peer.roomId).delete(socketId);
+        if (rooms.get(peer.roomId).size === 0) {
+          rooms.delete(peer.roomId);
+          chatHistory.delete(peer.roomId);
+          roomStartTime.delete(peer.roomId);
+          roomProducers.delete(peer.roomId);
         }
       }
+      peers.delete(socketId);
+    }
+  }
+
+  static addProducer(roomId, producerId, producerInfo) {
+    if (!roomProducers.has(roomId)) {
+      roomProducers.set(roomId, new Map());
+    }
+    roomProducers.get(roomId).set(producerId, producerInfo);
+  }
+
+  static removeProducer(roomId, producerId) {
+    if (roomProducers.has(roomId)) {
+      roomProducers.get(roomId).delete(producerId);
+    }
+  }
+
+  static getRoomProducers(roomId) {
+    return roomProducers.get(roomId) || new Map();
+  }
+
+  static getRoomUsers(roomId) {
+    if (!rooms.has(roomId)) return [];
+    return Array.from(rooms.get(roomId)).map(socketId => ({
+      id: socketId,
+      name: peers.get(socketId)?.name || 'Unknown'
+    }));
+  }
+
+  static addChatMessage(roomId, message) {
+    if (!chatHistory.has(roomId)) {
+      chatHistory.set(roomId, []);
+    }
+    const history = chatHistory.get(roomId);
+    history.push(message);
+    if (history.length > 100) {
+      history.shift();
+    }
+    return history;
+  }
+
+  static getChatHistory(roomId) {
+    return chatHistory.get(roomId) || [];
+  }
+
+  static getRoomStartTime(roomId) {
+    return roomStartTime.get(roomId) || Date.now();
+  }
+}
+
+async function initMediasoup() {
+  try {
+    worker = await mediasoup.createWorker({
+      rtcMinPort: 10000,
+      rtcMaxPort: 10100,
+      logLevel: 'warn',
+      logTags: ['info', 'ice', 'dtls', 'rtp', 'srtp', 'rtcp']
+    });
+
+    worker.on('died', () => {
+      console.error('Mediasoup worker died');
+      process.exit(1);
+    });
+
+    router = await worker.createRouter({ mediaCodecs });
+    console.log('✅ Mediasoup router created');
+  } catch (error) {
+    console.error('Failed to initialize Mediasoup:', error);
+    process.exit(1);
+  }
+}
+
+async function createWebRtcTransport() {
+  const transport = await router.createWebRtcTransport({
+    listenIps: [
+      { 
+        ip: '0.0.0.0', 
+        announcedIp: process.env.ANNOUNCED_IP || '127.0.0.1'
+      }
+    ],
+    enableUdp: true,
+    enableTcp: true,
+    preferUdp: true,
+    initialAvailableOutgoingBitrate: 1000000
+  });
+
+  transport.on('dtlsstatechange', (dtlsState) => {
+    if (dtlsState === 'closed') {
+      transport.close();
     }
   });
 
-  // Chat message handling
-  socket.on('chat-message', ({ roomId, message, name }) => {
+  return transport;
+}
+
+io.on('connection', (socket) => {
+  console.log(`👤 Connected: ${socket.id}`);
+
+  socket.on('join-room', ({ roomId, name }, callback = () => {}) => {
     try {
-      const room = rooms.get(roomId);
-      const user = room?.users.get(socket.id);
-      
-      // Validation
-      if (!room || !user || !message?.trim() || !name?.trim() || user.name !== name.trim()) {
-        console.warn(`❌ Chat validation failed for ${socket.id}`);
-        return;
-      }
-      
-      if (message.length > 500) {
-        socket.emit('error', { message: 'Message too long (max 500 characters)' });
-        return;
-      }
-      
-      if (isRateLimited(socket.id, 'chat', 30, 60000)) {
-        socket.emit('error', { message: 'Sending messages too quickly. Please slow down.' });
+      if (!roomId?.trim() || !name?.trim()) {
+        callback({ error: 'Invalid room ID or name' });
         return;
       }
 
-      const chatMessage = { 
-        name: user.name, 
-        message: message.trim(), 
-        timestamp: Date.now() 
-      };
+      socket.join(roomId);
+      RoomManager.addUser(roomId, socket.id, name.trim());
 
-      // Store message in room history
-      room.addMessage(chatMessage);
+      socket.emit('meeting-start-time', RoomManager.getRoomStartTime(roomId));
+      socket.emit('chat-history', RoomManager.getChatHistory(roomId));
 
-      // Broadcast to all users in the room (including sender)
-      io.to(roomId).emit('chat-message', chatMessage);
-      
-      console.log(`💬 Chat message in room ${roomId}: ${user.name}: ${message.trim()}`);
+      socket.to(roomId).emit('user-joined', {
+        userId: socket.id,
+        name: name.trim(),
+        cameraOn: false,
+        audioOn: false,
+        screenShareOn: false
+      });
+
+      const existingUsers = RoomManager.getRoomUsers(roomId)
+        .filter(user => user.id !== socket.id);
+
+      const existingProducers = Array.from(RoomManager.getRoomProducers(roomId).values());
+
+      console.log(`📤 ${name} joining: ${existingUsers.length} users, ${existingProducers.length} producers`);
+
+      callback({
+        rtpCapabilities: router.rtpCapabilities,
+        existingUsers,
+        existingProducers
+      });
+
+      console.log(`✅ ${name} joined room ${roomId}`);
     } catch (error) {
-      console.error('❌ Error in chat-message:', error);
-      socket.emit('error', { message: 'Failed to send message' });
+      console.error('Error joining room:', error);
+      callback({ error: error.message });
     }
   });
 
-  // Screen sharing events (legacy support)
+  socket.on('chat-message', ({ roomId, message, name }) => {
+    const peer = peers.get(socket.id);
+    if (!peer || !message?.trim()) return;
+
+    const chatMessage = {
+      name: peer.name,
+      message: message.trim(),
+      timestamp: Date.now()
+    };
+
+    RoomManager.addChatMessage(roomId, chatMessage);
+    io.to(roomId).emit('chat-message', chatMessage);
+  });
+
+  socket.on('media-status-change', ({ cameraOn, audioOn, screenShareOn }) => {
+    const peer = peers.get(socket.id);
+    if (!peer) return;
+
+    io.to(peer.roomId).emit('media-status-change', {
+      userId: socket.id,
+      cameraOn,
+      audioOn,
+      screenShareOn
+    });
+  });
+
   socket.on('start-screen-share', () => {
-    if (currentRoomId) {
-      // Update the user's status in the room
-      const room = rooms.get(currentRoomId);
-      if (room) {
-        room.updateUserStatus(socket.id, { screenShareOn: true });
-      }
-      
-      socket.to(currentRoomId).emit('user-started-screen-share', { 
+    const peer = peers.get(socket.id);
+    if (peer) {
+      io.to(peer.roomId).emit('user-started-screen-share', {
         userId: socket.id,
-        name: userName 
+        name: peer.name
       });
-      console.log(`🖥️ User ${userName} started screen sharing in room ${currentRoomId}`);
     }
   });
 
   socket.on('stop-screen-share', () => {
-    if (currentRoomId) {
-      // Update the user's status in the room
-      const room = rooms.get(currentRoomId);
-      if (room) {
-        room.updateUserStatus(socket.id, { screenShareOn: false });
-      }
-      
-      socket.to(currentRoomId).emit('user-stopped-screen-share', { 
+    const peer = peers.get(socket.id);
+    if (peer) {
+      io.to(peer.roomId).emit('user-stopped-screen-share', {
         userId: socket.id,
-        name: userName 
+        name: peer.name
       });
-      console.log(`🖥️ User ${userName} stopped screen sharing in room ${currentRoomId}`);
     }
   });
 
-  // Enhanced disconnect handling
-  socket.on('disconnect', (reason) => {
-    connectionStats.total = Math.max(0, connectionStats.total - 1);
-    console.log(`👋 Disconnected: ${socket.id} (${reason}) - Total: ${connectionStats.total}`);
+  socket.on('create-transport', async (callback = () => {}) => {
+    try {
+      const transport = await createWebRtcTransport();
+      const peer = peers.get(socket.id);
+      if (peer) {
+        peer.transports.set(transport.id, transport);
+      }
 
-    if (currentRoomId) {
-      const room = rooms.get(currentRoomId);
-      if (room) {
-        const wasRemoved = room.removeUser(socket.id);
-        if (wasRemoved) {
-          socket.to(currentRoomId).emit('user-left', socket.id);
-          console.log(`👤 User ${userName || socket.id} left room ${currentRoomId} (${room.users.size} users remaining)`);
-          
-          // Schedule cleanup if room is empty
-          if (room.isEmpty()) {
-            scheduleCleanup();
-          }
+      callback({
+        transportId: transport.id,
+        iceParameters: transport.iceParameters,
+        iceCandidates: transport.iceCandidates,
+        dtlsParameters: transport.dtlsParameters
+      });
+    } catch (error) {
+      console.error('Error creating transport:', error);
+      callback({ error: error.message });
+    }
+  });
+
+  socket.on('connect-transport', async ({ transportId, dtlsParameters }, callback = () => {}) => {
+    try {
+      const peer = peers.get(socket.id);
+      const transport = peer?.transports.get(transportId);
+      
+      if (!transport) {
+        callback({ error: 'Transport not found' });
+        return;
+      }
+
+      await transport.connect({ dtlsParameters });
+      callback({ success: true });
+    } catch (error) {
+      console.error('Error connecting transport:', error);
+      callback({ error: error.message });
+    }
+  });
+
+  socket.on('produce', async ({ transportId, kind, rtpParameters, appData }, callback = () => {}) => {
+    try {
+      const peer = peers.get(socket.id);
+      const transport = peer?.transports.get(transportId);
+      
+      if (!transport) {
+        callback({ error: 'Transport not found' });
+        return;
+      }
+
+      const producer = await transport.produce({
+        kind,
+        rtpParameters,
+        appData: {
+          ...appData,
+          userId: socket.id,
+          name: peer.name
+        }
+      });
+
+      peer.producers.set(producer.id, producer);
+
+      RoomManager.addProducer(peer.roomId, producer.id, {
+        producerId: producer.id,
+        userId: socket.id,
+        name: peer.name,
+        kind,
+        appData: producer.appData
+      });
+
+      producer.on('transportclose', () => {
+        peer.producers.delete(producer.id);
+        RoomManager.removeProducer(peer.roomId, producer.id);
+      });
+
+      callback({ producerId: producer.id });
+
+      socket.to(peer.roomId).emit('new-producer', {
+        producerId: producer.id,
+        userId: socket.id,
+        name: peer.name,
+        kind,
+        appData: producer.appData
+      });
+
+      console.log(`📤 ${peer.name} producing ${kind} (${appData.isScreenShare ? 'screen' : appData.isAudio ? 'audio' : 'camera'})`);
+    } catch (error) {
+      console.error('Error producing:', error);
+      callback({ error: error.message });
+    }
+  });
+
+  socket.on('close-producer', ({ producerId }, callback = () => {}) => {
+    try {
+      const peer = peers.get(socket.id);
+      const producer = peer?.producers.get(producerId);
+      
+      if (producer) {
+        producer.close();
+        peer.producers.delete(producerId);
+        RoomManager.removeProducer(peer.roomId, producerId);
+        
+        socket.to(peer.roomId).emit('producer-closed', {
+          producerId,
+          userId: socket.id
+        });
+      }
+      
+      callback({ success: true });
+    } catch (error) {
+      callback({ error: error.message });
+    }
+  });
+
+  socket.on('consume', async ({ transportId, producerId, rtpCapabilities }, callback = () => {}) => {
+    try {
+      const peer = peers.get(socket.id);
+      const transport = peer?.transports.get(transportId);
+      
+      if (!transport) {
+        callback({ error: 'Transport not found' });
+        return;
+      }
+
+      let producer = null;
+      for (const [peerId, p] of peers) {
+        if (p.producers.has(producerId)) {
+          producer = p.producers.get(producerId);
+          break;
         }
       }
+
+      if (!producer) {
+        callback({ error: 'Producer not found' });
+        return;
+      }
+
+      if (!router.canConsume({ producerId, rtpCapabilities })) {
+        callback({ error: 'Cannot consume this producer' });
+        return;
+      }
+
+      const consumer = await transport.consume({
+        producerId,
+        rtpCapabilities,
+        paused: false
+      });
+
+      peer.consumers.set(consumer.id, consumer);
+
+      consumer.on('transportclose', () => {
+        peer.consumers.delete(consumer.id);
+      });
+
+      callback({
+        consumerId: consumer.id,
+        producerId: producer.id,
+        kind: consumer.kind,
+        rtpParameters: consumer.rtpParameters,
+        appData: producer.appData
+      });
+    } catch (error) {
+      console.error('Error consuming:', error);
+      callback({ error: error.message });
     }
   });
 
-  socket.on('error', (error) => {
-    console.error(`❌ Socket error ${socket.id}:`, error);
+  socket.on('resume-consumer', async ({ consumerId }, callback = () => {}) => {
+    try {
+      const peer = peers.get(socket.id);
+      const consumer = peer?.consumers.get(consumerId);
+      
+      if (consumer) {
+        await consumer.resume();
+      }
+      
+      callback({ success: true });
+    } catch (error) {
+      callback({ error: error.message });
+    }
+  });
+
+  socket.on('ping-from-client', () => {
+    socket.emit('pong-from-server', Date.now());
+  });
+
+  socket.on('disconnect', () => {
+    console.log(`👋 Disconnected: ${socket.id}`);
+    
+    const peer = peers.get(socket.id);
+    if (peer) {
+      socket.to(peer.roomId).emit('user-left', socket.id);
+      RoomManager.removeUser(socket.id);
+    }
   });
 });
 
-// Health endpoints
 app.get('/health', (req, res) => {
-  const totalUsers = Array.from(rooms.values()).reduce((sum, room) => sum + room.users.size, 0);
-  const totalMessages = Array.from(rooms.values()).reduce((sum, room) => sum + room.chatHistory.length, 0);
-  
-  res.json({ 
-    status: 'healthy', 
-    timestamp: Date.now(),
-    connections: connectionStats.total,
-    peak_connections: connectionStats.peak,
-    total_connections_served: connectionStats.totalConnections,
+  res.json({
+    status: 'healthy',
     rooms: rooms.size,
-    total_users: totalUsers,
-    total_messages: totalMessages,
-    memory_usage: process.memoryUsage(),
-    uptime: process.uptime(),
-    redis_connected: !!(pubClient && subClient)
+    peers: peers.size,
+    uptime: process.uptime()
   });
 });
 
-app.get('/api/rooms/:roomId/stats', (req, res) => {
-  const { roomId } = req.params;
-  const room = rooms.get(roomId);
+const PORT = process.env.PORT || 3001;
+
+async function startServer() {
+  await initMediasoup();
   
-  if (!room) {
-    return res.status(404).json({ error: 'Room not found' });
-  }
-  
-  res.json({ 
-    roomId,
-    userCount: room.users.size,
-    messageCount: room.messageCount,
-    chatHistoryLength: room.chatHistory.length,
-    createdAt: room.createdAt,
-    lastActivity: room.lastActivity,
-    users: room.getUsersArray().map(u => ({ 
-      id: u.id, 
-      name: u.name, 
-      joinedAt: u.joinedAt,
-      cameraOn: u.cameraOn,
-      audioOn: u.audioOn,
-      screenShareOn: u.screenShareOn
-    })),
-    recentMessages: room.getChatHistory(10)
+  server.listen(PORT, () => {
+    console.log(`🚀 Mediasoup server running on port ${PORT}`);
+    console.log(`📊 Health: http://localhost:${PORT}/health`);
   });
-});
-
-app.get('/api/stats', (req, res) => {
-  const roomStats = Array.from(rooms.values()).map(room => ({ 
-    id: room.id, 
-    users: room.users.size, 
-    messages: room.messageCount,
-    chatHistory: room.chatHistory.length,
-    lastActivity: room.lastActivity,
-    createdAt: room.createdAt
-  }));
-  
-  res.json({ 
-    totalRooms: rooms.size,
-    totalConnections: connectionStats.total,
-    peakConnections: connectionStats.peak,
-    totalConnectionsServed: connectionStats.totalConnections,
-    totalUsers: roomStats.reduce((sum, room) => sum + room.users, 0),
-    totalMessages: roomStats.reduce((sum, room) => sum + room.chatHistory, 0),
-    rooms: roomStats,
-    memoryUsage: process.memoryUsage(),
-    uptime: process.uptime(),
-    redisConnected: !!(pubClient && subClient)
-  });
-});
-
-// Error handling middleware
-app.use((error, req, res, next) => {
-  console.error('❌ Express error:', error);
-  res.status(500).json({ error: 'Internal server error' });
-});
-
-// Graceful shutdown
-const gracefulShutdown = (signal) => {
-  console.log(`📡 ${signal} received - shutting down gracefully`);
-  
-  io.emit('server-shutdown', { 
-    message: 'Server maintenance in progress. You will be reconnected automatically.', 
-    reconnect: true,
-    timestamp: Date.now()
-  });
-  
-  setTimeout(() => {
-    server.close(() => {
-      console.log('🔌 HTTP server closed');
-      
-      if (pubClient) {
-        pubClient.quit().then(() => console.log('📡 Redis pub client closed'));
-      }
-      if (subClient) {
-        subClient.quit().then(() => console.log('📡 Redis sub client closed'));
-      }
-      
-      console.log('✅ Server shut down gracefully');
-      process.exit(0);
-    });
-  }, 3000);
-};
-
-process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
-process.on('SIGINT', () => gracefulShutdown('SIGINT'));
-process.on('uncaughtException', (error) => {
-  console.error('💥 Uncaught Exception:', error);
-  gracefulShutdown('UNCAUGHT_EXCEPTION');
-});
-
-// Periodic garbage collection
-if (global.gc) {
-  setInterval(() => {
-    global.gc();
-    console.log('🗑️ Manual garbage collection triggered');
-  }, 5 * 60 * 1000);
 }
 
-// Server startup
-const PORT = process.env.PORT || 3001;
-const HOST = process.env.HOST || '0.0.0.0';
-
-server.listen(PORT, HOST, () => {
-  console.log(`🚀 Optimized Socket.IO server running on ${HOST}:${PORT}`);
-  console.log(`📊 Health: http://${HOST}:${PORT}/health`);
-  console.log(`📈 Stats: http://${HOST}:${PORT}/api/stats`);
-  console.log(`🎯 Configuration:`);
-  console.log(`   - Max users per room: ${MAX_USERS_PER_ROOM}`);
-  console.log(`   - Max rooms: ${MAX_ROOMS}`);
-  console.log(`   - Chat history limit: ${MAX_CHAT_HISTORY}`);
-  console.log(`💾 Redis adapter: ${pubClient ? '✅ Enabled' : '❌ Disabled (using memory)'}`);
-  console.log(`🛡️ Features: Rate limiting, compression, CORS, graceful shutdown`);
-});
+startServer().catch(console.error);

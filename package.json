@@ -1,5 +1,5 @@
 {
-  "name": "my-call-app",
+  "name": "bini-meetings",
   "version": "0.1.0",
   "private": true,
   "type": "module",
@@ -12,19 +12,22 @@
   "dependencies": {
     "@socket.io/redis-adapter": "^8.3.0",
     "compression": "^1.8.1",
-    "express": "^5.1.0",
-    "express-rate-limit": "^8.0.1",
+    "cors": "^2.8.6",
+    "express": "^5.2.1",
+    "express-rate-limit": "^8.7.0",
     "helmet": "^8.1.0",
     "ioredis": "^5.7.0",
     "lru-cache": "^11.1.0",
     "lucide-react": "^0.542.0",
+    "mediasoup": "^3.26.0",
+    "mediasoup-client": "^3.23.1",
     "next": "15.5.2",
     "react": "19.1.0",
     "react-dom": "19.1.0",
     "redis": "^5.8.2",
     "simple-peer": "^9.11.1",
-    "socket.io": "^4.8.1",
-    "socket.io-client": "^4.8.1",
+    "socket.io": "^4.8.3",
+    "socket.io-client": "^4.8.3",
     "uuid": "^11.1.0"
   },
   "devDependencies": {

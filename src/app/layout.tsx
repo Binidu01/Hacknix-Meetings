@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import { Geist, Geist_Mono } from "next/font/google";
+// @ts-ignore
 import "./globals.css";
 
 const geistSans = Geist({
@@ -13,7 +14,7 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "Hacknix Meetings",
+  title: "Bini Meetings",
   description: "A modern, real-time video conferencing web application that enables seamless communication with high-quality video, audio, screen sharing, and chat functionality.",
 };
 
