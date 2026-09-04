@@ -100,10 +100,9 @@ export default function RoomPage() {
       return;
     }
 
-    // Navigate to meeting page with media state
-    router.push(
-      `/meeting/${roomId}?name=${encodeURIComponent(name)}&camera=${cameraOn}&audio=${audioOn}`
-    );
+    // Navigate to meeting page — camera/mic always start off/muted there,
+    // regardless of what was toggled in this preview.
+    router.push(`/meeting/${roomId}?name=${encodeURIComponent(name)}`);
   };
 
   return (
