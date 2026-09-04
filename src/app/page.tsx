@@ -1,10 +1,10 @@
 'use client';
 
 import { useRouter } from 'next/navigation';
-import { useCallback, useMemo } from 'react';
+import { useCallback } from 'react';
 import { v4 as uuidv4 } from 'uuid';
 import Image from 'next/image';
-import { Video, Users, Shield, Zap, ArrowRight } from 'lucide-react';
+import { Video, MessageSquare, Monitor, Shield, Mic, PhoneOff, ArrowRight, Clock, Copy } from 'lucide-react';
 
 export default function Home() {
   const router = useRouter();
@@ -14,106 +14,144 @@ export default function Home() {
     router.push(`/room/${roomId}`);
   }, [router]);
 
-  const biniLogo = useMemo(() => ({
-    src: '/logo.png',
-    alt: 'Bini Logo',
-    width: 420,
-    height: 105,
-  }), []);
-
-  const features = [
+  const capabilities = [
     {
-      icon: <Video className="w-5 h-5" />,
-      title: "HD Video Calls",
-      description: "Crystal clear video quality for professional meetings"
+      icon: <Video className="w-4 h-4" />,
+      title: "Multi-party video",
+      description: "Powered by a WebRTC SFU, so calls stay smooth."
     },
     {
-      icon: <Users className="w-5 h-5" />,
-      title: "Team Collaboration",
-      description: "Seamless collaboration tools for productive teamwork"
+      icon: <Monitor className="w-4 h-4" />,
+      title: "Screen sharing",
+      description: "Share a window or tab, with system audio when you need it."
     },
     {
-      icon: <Shield className="w-5 h-5" />,
-      title: "Secure & Private",
-      description: "End-to-end encryption keeps your meetings safe"
+      icon: <MessageSquare className="w-4 h-4" />,
+      title: "In-call chat",
+      description: "Send a message to the room without interrupting the call."
     },
     {
-      icon: <Zap className="w-5 h-5" />,
-      title: "Lightning Fast",
-      description: "Optimized performance for smooth meeting experience"
+      icon: <Shield className="w-4 h-4" />,
+      title: "Encrypted by default",
+      description: "Every call runs over an encrypted WebRTC connection."
     }
   ];
 
+  // Static preview of the real gallery UI — not decorative, this mirrors
+  // the actual call screen (see the meeting page grid/controls).
+  const previewTiles = [
+    { initial: 'A', color: '#4f46e5' },
+    { initial: 'J', color: '#0891b2' },
+    { initial: 'M', color: '#7c3aed' },
+    { initial: 'T', color: '#334155' },
+  ];
+
   return (
-    <div className="min-h-screen bg-[#0a0a0f] text-white overflow-hidden">
-      {/* Animated background elements */}
-      <div className="absolute inset-0 overflow-hidden">
-        <div className="absolute -top-40 -right-40 w-80 h-80 bg-indigo-500/10 rounded-full blur-3xl animate-pulse"></div>
-        <div className="absolute -bottom-40 -left-40 w-80 h-80 bg-indigo-500/10 rounded-full blur-3xl animate-pulse delay-1000"></div>
-        <div className="absolute top-1/2 left-1/2 transform -translate-x-1/2 -translate-y-1/2 w-96 h-96 bg-indigo-500/5 rounded-full blur-3xl animate-pulse delay-500"></div>
-      </div>
-
-      {/* Main content */}
-      <div className="relative z-10 flex flex-col items-center justify-center min-h-screen px-6 py-10 text-center">
-        {/* Logo section - main header, very large */}
-        <div className="mb-12 transform hover:scale-105 transition-transform duration-300">
-          <Image {...biniLogo} className="brightness-0 invert" />
+    <div className="fixed inset-0 bg-[#0a0a0f] text-white flex flex-col overflow-hidden">
+      {/* Header */}
+      <header className="flex items-center justify-between px-6 sm:px-10 py-3 max-w-6xl mx-auto w-full flex-shrink-0">
+        <div className="relative w-[110px] h-[37px]">
+          <Image
+            src="/logo.png"
+            alt="Bini Logo"
+            fill
+            className="object-cover brightness-0 invert"
+          />
         </div>
+        <button
+          onClick={handleGetStarted}
+          className="hidden sm:flex items-center gap-1.5 px-4 py-2 rounded-full text-sm font-medium bg-white/5 hover:bg-white/10 border border-white/10 transition-all duration-200 active:scale-95"
+        >
+          Start a meeting
+        </button>
+      </header>
 
-        {/* Hero section - no purple line */}
-        <div className="max-w-4xl mx-auto mb-16">
-          <p className="text-xl md:text-2xl text-gray-400 mb-12 leading-relaxed max-w-3xl">
-            Experience the future of online collaboration with our lightweight, secure, and lightning-fast meeting platform. 
-            <span className="text-indigo-300 font-medium"> Connect instantly</span> and 
-            <span className="text-indigo-300 font-medium"> collaborate seamlessly</span> with your team.
-          </p>
+      {/* Main content, vertically centered in the remaining space */}
+      <main className="flex-1 flex flex-col justify-center min-h-0 px-6 sm:px-10 max-w-6xl mx-auto w-full">
+        {/* Hero */}
+        <section className="grid lg:grid-cols-2 gap-10 items-center mb-8">
+          {/* Copy */}
+          <div>
+            <h1 className="text-3xl sm:text-4xl font-semibold tracking-tight text-gray-50 leading-[1.1] mb-4">
+              Video meetings that just work.
+            </h1>
+            <p className="text-sm sm:text-base text-gray-400 leading-relaxed mb-6 max-w-md">
+              Start a call, share the link, and talk. No accounts and nothing
+              to install — just open the room in your browser.
+            </p>
 
-          {/* CTA Button */}
-          <button
-            onClick={handleGetStarted}
-            className="group relative px-12 py-5 bg-indigo-600 hover:bg-indigo-500 rounded-2xl text-xl font-semibold transform hover:scale-105 hover:shadow-2xl hover:shadow-indigo-500/20 transition-all duration-200 active:scale-95 border border-indigo-500/30"
-          >
-            <span className="relative z-10 flex items-center gap-2">
-              Get Started Now
-              <ArrowRight className="w-5 h-5 group-hover:translate-x-1 transition-transform duration-200" />
-            </span>
-          </button>
-        </div>
+            <div className="flex items-center gap-4">
+              <button
+                onClick={handleGetStarted}
+                className="group inline-flex items-center gap-2 px-6 py-3 bg-indigo-600 hover:bg-indigo-500 rounded-2xl text-sm font-semibold transition-all duration-200 active:scale-95 border border-indigo-500/30"
+              >
+                Start a meeting
+                <ArrowRight className="w-4 h-4 group-hover:translate-x-1 transition-transform duration-200" />
+              </button>
+              <span className="text-sm text-gray-500">No sign-up required</span>
+            </div>
+          </div>
 
-        {/* Features grid */}
-        <div className="grid md:grid-cols-2 lg:grid-cols-4 gap-5 max-w-6xl mx-auto">
-          {features.map((feature, index) => (
-            <div 
-              key={index}
-              className="group p-6 bg-white/5 backdrop-blur-sm rounded-2xl border border-white/10 hover:bg-white/10 hover:border-white/20 transform hover:scale-105 hover:-translate-y-1 transition-all duration-300"
-            >
-              <div className="flex flex-col items-center text-center">
-                <div className="p-3 bg-white/5 rounded-xl mb-4 group-hover:bg-indigo-500/20 transition-all duration-300 border border-white/5 group-hover:border-indigo-500/30">
-                  <div className="text-indigo-400 group-hover:text-indigo-300 transition-colors duration-300">
-                    {feature.icon}
-                  </div>
+          {/* Product preview */}
+          <div className="rounded-2xl border border-white/10 bg-[#0d0d14] shadow-2xl overflow-hidden">
+            <div className="flex items-center justify-between px-4 py-2.5 border-b border-white/5">
+              <div className="flex items-center gap-1.5 text-xs text-gray-500">
+                <Clock className="w-3 h-3" />
+                04:12
+              </div>
+              <span className="text-xs text-gray-600 font-mono">room-2f8a91</span>
+            </div>
+            <div className="grid grid-cols-2 gap-2 p-3">
+              {previewTiles.map((tile) => (
+                <div
+                  key={tile.initial}
+                  className="aspect-video rounded-lg flex items-center justify-center text-sm font-semibold text-white/90"
+                  style={{ background: `linear-gradient(145deg, ${tile.color}, #14141f)` }}
+                >
+                  {tile.initial}
                 </div>
-                <h3 className="text-base font-medium mb-2 text-gray-200 group-hover:text-white transition-colors duration-300">
-                  {feature.title}
-                </h3>
-                <p className="text-sm text-gray-500 group-hover:text-gray-400 transition-colors duration-300">
-                  {feature.description}
-                </p>
+              ))}
+            </div>
+            <div className="flex items-center justify-center gap-2 px-4 py-2.5 border-t border-white/5">
+              <div className="w-8 h-8 rounded-full bg-white/5 border border-white/10 flex items-center justify-center text-gray-300">
+                <Mic size={14} />
+              </div>
+              <div className="w-8 h-8 rounded-full bg-white/5 border border-white/10 flex items-center justify-center text-gray-300">
+                <Video size={14} />
+              </div>
+              <div className="w-8 h-8 rounded-full bg-white/5 border border-white/10 flex items-center justify-center text-gray-300">
+                <MessageSquare size={14} />
+              </div>
+              <div className="w-8 h-8 rounded-full bg-white/5 border border-white/10 flex items-center justify-center text-gray-300">
+                <Copy size={14} />
+              </div>
+              <div className="w-8 h-8 rounded-full bg-red-500/80 flex items-center justify-center text-white">
+                <PhoneOff size={14} />
               </div>
             </div>
-          ))}
-        </div>
-      </div>
+          </div>
+        </section>
 
-      {/* Static decorative elements */}
-      <div className="absolute inset-0 overflow-hidden pointer-events-none">
-        <div className="absolute top-20 left-20 w-2 h-2 bg-white/5 rounded-full animate-pulse delay-1000"></div>
-        <div className="absolute top-40 right-32 w-1 h-1 bg-indigo-300/10 rounded-full animate-pulse delay-2000"></div>
-        <div className="absolute bottom-32 left-40 w-1.5 h-1.5 bg-indigo-300/10 rounded-full animate-pulse delay-500"></div>
-        <div className="absolute bottom-20 right-20 w-1 h-1 bg-white/5 rounded-full animate-pulse delay-3000"></div>
-        <div className="absolute top-1/2 left-10 w-1 h-1 bg-indigo-400/10 rounded-full animate-pulse delay-1500"></div>
-        <div className="absolute top-1/3 right-10 w-2 h-2 bg-indigo-400/10 rounded-full animate-pulse delay-2500"></div>
-      </div>
+        {/* Capabilities */}
+        <section className="max-w-4xl w-full mt-14">
+          <div className="grid sm:grid-cols-2 gap-x-6 gap-y-8">
+            {capabilities.map((item) => (
+              <div
+                key={item.title}
+                className="flex items-start gap-4 p-4 rounded-2xl bg-white/5 border border-white/10"
+              >
+                <div className="w-9 h-9 rounded-lg bg-white/5 border border-white/10 flex items-center justify-center text-indigo-400 flex-shrink-0">
+                  {item.icon}
+                </div>
+                <div>
+                  <h3 className="text-sm font-medium text-gray-100 mb-1">{item.title}</h3>
+                  <p className="text-xs text-gray-500 leading-relaxed">{item.description}</p>
+                </div>
+              </div>
+            ))}
+          </div>
+        </section>
+      </main>
     </div>
   );
 }
